@@ -2,6 +2,13 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    // FluidAudio is macOS/iOS only (requires Swift, CoreML, Apple frameworks).
+    // On other platforms, skip the Swift build entirely so dependents can
+    // compile with this crate as an optional dependency.
+    if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() != "macos" {
+        return;
+    }
+
     // Tell Cargo to rerun if Swift files change
     println!("cargo:rerun-if-changed=swift/");
     println!("cargo:rerun-if-changed=Package.swift");
@@ -19,8 +26,10 @@ fn main() {
     let status = Command::new("swift")
         .args(&[
             "build",
-            "-c", "release",
-            "--build-path", swift_build_dir.to_str().unwrap(),
+            "-c",
+            "release",
+            "--build-path",
+            swift_build_dir.to_str().unwrap(),
         ])
         .current_dir(&manifest_dir)
         .status()
