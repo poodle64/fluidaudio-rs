@@ -59,4 +59,38 @@ fn main() {
 
     // Link C++ standard library (needed for FastClusterWrapper.cpp in FluidAudio)
     println!("cargo:rustc-link-lib=c++");
+
+    // Add Swift runtime library rpaths so dyld can find libswift_Concurrency.dylib
+    // and other Swift runtime libraries at runtime.
+    //
+    // On deployment targets < macOS 15.0, Swift Concurrency resolves via @rpath
+    // (the tbd has $ld$previous$@rpath/libswift_Concurrency.dylib$$6$13.1$15.0$$).
+    // We need rpaths pointing to the Swift runtime library directories.
+    //
+    // Use `swift -print-target-info` to find the correct paths dynamically.
+    if let Ok(output) = Command::new("swift").args(&["-print-target-info"]).output() {
+        if output.status.success() {
+            if let Ok(json_str) = String::from_utf8(output.stdout) {
+                // Parse the JSON to extract runtimeLibraryPaths
+                // Format: { "paths": { "runtimeLibraryPaths": ["/path1", "/path2"] } }
+                if let Some(paths_start) = json_str.find("\"runtimeLibraryPaths\"") {
+                    if let Some(arr_start) = json_str[paths_start..].find('[') {
+                        let arr_offset = paths_start + arr_start;
+                        if let Some(arr_end) = json_str[arr_offset..].find(']') {
+                            let arr_str = &json_str[arr_offset + 1..arr_offset + arr_end];
+                            for item in arr_str.split(',') {
+                                let path = item.trim().trim_matches('"').trim();
+                                if !path.is_empty() {
+                                    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: always add /usr/lib/swift in case the dynamic detection missed it
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 }
