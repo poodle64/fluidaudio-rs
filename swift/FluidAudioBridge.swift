@@ -73,7 +73,19 @@ final class FluidAudioBridgeInternal: @unchecked Sendable {
         // self happens back on this (sync) thread after runBlocking returns.
         let (models, manager) = try runBlocking { () -> (AsrModels, AsrManager) in
             let models = try await AsrModels.downloadAndLoad()
-            return (models, AsrManager(models: models))
+            // melChunkContext: false selects FluidAudio's silence-aligned +
+            // acoustic-warmup chunking for the v3 long-form batch path instead
+            // of the default 80ms mel-context prepend with fixed-stride,
+            // parallel, SOS-cold-started chunks. The default path drops the tail
+            // of recordings whose final chunk opens mid-utterance: that chunk
+            // cold-starts the TDT decoder from SOS, the joint predicts blank for
+            // every frame, the chunk yields zero tokens, and the last words are
+            // lost (e.g. "...waiting for port colours[ to finish being built]").
+            // The silence-aligned path warms each chunk from real audio context,
+            // which decodes those tails correctly. Verified across recordings of
+            // 19s–52s; no English-accuracy regression observed.
+            let config = ASRConfig(melChunkContext: false)
+            return (models, AsrManager(config: config, models: models))
         }
         self.asrModels = models
         self.asrManager = manager
