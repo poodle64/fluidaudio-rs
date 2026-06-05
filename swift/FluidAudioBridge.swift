@@ -3,10 +3,63 @@ import AVFoundation
 import FluidAudio
 import Darwin
 
+// MARK: - Sync/async bridge
+
+/// Runs an async, possibly actor-isolated operation to completion synchronously
+/// and returns its result. For use ONLY at the synchronous C FFI boundary
+/// (`@_cdecl` functions) which cannot be made async. The result crosses back
+/// through a `Sendable` box, so the `Task` closure captures only `Sendable`
+/// values and stays race-free under Swift 6 strict concurrency.
+///
+/// Must NOT be called from within another Swift `async` context: `wait()`
+/// blocks the calling thread, and blocking a cooperative-pool thread can
+/// deadlock the executor. At a sync FFI edge (a dedicated caller thread) this
+/// is the accepted pattern.
+func runBlocking<T: Sendable>(
+    _ operation: @escaping @Sendable () async throws -> T
+) throws -> T {
+    let box = ResultBox<T>()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        let outcome: Result<T, Error>
+        do {
+            outcome = .success(try await operation())
+        } catch {
+            outcome = .failure(error)
+        }
+        box.set(outcome)
+        semaphore.signal()
+    }
+    semaphore.wait()
+    return try box.take()
+}
+
+/// Sendable hand-off container. The lock makes `@unchecked Sendable` sound:
+/// the write happens-before `signal()` and the read happens-after `wait()`.
+private final class ResultBox<T: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Result<T, Error>?
+
+    func set(_ result: Result<T, Error>) {
+        lock.lock(); defer { lock.unlock() }
+        value = result
+    }
+
+    func take() throws -> T {
+        lock.lock(); defer { lock.unlock() }
+        guard let value else { throw BridgeError.noResult }
+        return try value.get()
+    }
+}
+
 // MARK: - Bridge Class
 
-/// Internal bridge class that wraps FluidAudio
-class FluidAudioBridgeInternal {
+/// Internal bridge class that wraps FluidAudio.
+///
+/// `@unchecked Sendable`: instances are owned by the C FFI layer, which holds a
+/// single global bridge and serialises every call (one transcription at a
+/// time), so the stored model/manager fields are never touched concurrently.
+final class FluidAudioBridgeInternal: @unchecked Sendable {
     private var asrManager: AsrManager?
     private var asrModels: AsrModels?
     private var vadManager: VadManager?
@@ -14,28 +67,16 @@ class FluidAudioBridgeInternal {
     init() {}
 
     func initializeAsr() throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var initError: Error?
-
-        Task {
-            do {
-                let models = try await AsrModels.downloadAndLoad()
-                self.asrModels = models
-
-                let manager = AsrManager()
-                try await manager.initialize(models: models)
-                self.asrManager = manager
-            } catch {
-                initError = error
-            }
-            semaphore.signal()
+        // FluidAudio 0.15: AsrManager is an actor constructed with its models
+        // injected; the separate initialize(models:) step was removed. The
+        // model load and manager construction run async; the assignment to
+        // self happens back on this (sync) thread after runBlocking returns.
+        let (models, manager) = try runBlocking { () -> (AsrModels, AsrManager) in
+            let models = try await AsrModels.downloadAndLoad()
+            return (models, AsrManager(models: models))
         }
-
-        semaphore.wait()
-
-        if let error = initError {
-            throw error
-        }
+        self.asrModels = models
+        self.asrManager = manager
     }
 
     func transcribeFile(_ path: String) throws -> (String, Float, Double, Double, Float) {
@@ -43,28 +84,14 @@ class FluidAudioBridgeInternal {
             throw BridgeError.notInitialized
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        var result: ASRResult?
-        var transcribeError: Error?
-
-        Task {
-            do {
-                let url = URL(fileURLWithPath: path)
-                result = try await manager.transcribe(url)
-            } catch {
-                transcribeError = error
-            }
-            semaphore.signal()
-        }
-
-        semaphore.wait()
-
-        if let error = transcribeError {
-            throw error
-        }
-
-        guard let r = result else {
-            throw BridgeError.noResult
+        let r = try runBlocking { () -> ASRResult in
+            let url = URL(fileURLWithPath: path)
+            // FluidAudio 0.15: transcribe requires an inout decoder state. The
+            // var is local to this closure, so &decoderState is legal here; a
+            // fresh state per call keeps decoder context from leaking between
+            // recordings.
+            var decoderState = TdtDecoderState.make()
+            return try await manager.transcribe(url, decoderState: &decoderState)
         }
 
         return (r.text, r.confidence, r.duration, r.processingTime, r.rtfx)
@@ -75,25 +102,11 @@ class FluidAudioBridgeInternal {
     }
 
     func initializeVad(_ threshold: Float) throws {
-        let semaphore = DispatchSemaphore(value: 0)
-        var initError: Error?
-
-        Task {
-            do {
-                let config = VadConfig(defaultThreshold: threshold)
-                let manager = try await VadManager(config: config)
-                self.vadManager = manager
-            } catch {
-                initError = error
-            }
-            semaphore.signal()
+        let manager = try runBlocking { () -> VadManager in
+            let config = VadConfig(defaultThreshold: threshold)
+            return try await VadManager(config: config)
         }
-
-        semaphore.wait()
-
-        if let error = initError {
-            throw error
-        }
+        self.vadManager = manager
     }
 
     func isVadAvailable() -> Bool {
@@ -114,8 +127,11 @@ enum BridgeError: Error {
 
 // MARK: - C FFI Functions
 
-/// Storage for bridge instances (simple approach - use a single global for now)
-private var globalBridge: FluidAudioBridgeInternal?
+/// Storage for bridge instances (simple approach - use a single global for now).
+/// Access is serialised by the Rust FFI layer (one global bridge, one
+/// transcription at a time), so nonisolated(unsafe) is sound under Swift 6's
+/// strict concurrency checking.
+nonisolated(unsafe) private var globalBridge: FluidAudioBridgeInternal?
 
 @_cdecl("fluidaudio_bridge_create")
 public func fluidaudio_bridge_create() -> UnsafeMutableRawPointer? {
