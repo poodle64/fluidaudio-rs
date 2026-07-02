@@ -5,18 +5,22 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   publish:
     name: Publish to crates.io
+    # by-exception (2026-07-03): needs macOS toolchain — Rust/Swift package requires Apple SDK; cross-compilation not viable on the household runner
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Verify version matches tag
         run: |
@@ -36,8 +40,15 @@ jobs:
         run: cargo publish
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1
         with:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify failure (ntfy infra)
+        if: failure() && github.event_name != 'pull_request'
+        uses: poodle64/master-project/.github/actions/ntfy-failure@main
+        with:
+          title: 'fluidaudio-rs: release publish failed'
+          token: ${{ secrets.NTFY_TOKEN }}

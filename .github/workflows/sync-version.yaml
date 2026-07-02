@@ -6,11 +6,16 @@ on:
     - cron: '0 0 * * *'
   workflow_dispatch: # Manual trigger
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   sync:
+    # by-exception (2026-07-03): ubuntu runner appropriate for this lightweight version-sync bot; no Apple SDK required
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Get latest FluidAudio version
         id: fluidaudio
@@ -52,7 +57,7 @@ jobs:
 
       - name: Create Pull Request
         if: steps.check.outputs.needs_update == 'true'
-        uses: peter-evans/create-pull-request@v5
+        uses: peter-evans/create-pull-request@4e1beaa7521e8b457b572c090b25bd3db56bf1c5 # v5
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "Sync to FluidAudio ${{ steps.fluidaudio.outputs.version }}"
@@ -66,3 +71,10 @@ jobs:
             After merging, tag with `v${{ steps.fluidaudio.outputs.version }}` to publish.
           branch: sync-fluidaudio-${{ steps.fluidaudio.outputs.version }}
           delete-branch: true
+
+      - name: Notify failure (ntfy infra)
+        if: failure() && github.event_name != 'pull_request'
+        uses: poodle64/master-project/.github/actions/ntfy-failure@main
+        with:
+          title: 'fluidaudio-rs: sync-version failed'
+          token: ${{ secrets.NTFY_TOKEN }}
