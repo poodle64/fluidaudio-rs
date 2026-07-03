@@ -1,1 +1,4 @@
 /target
+
+# Swift Package Manager build artefacts
+.build/
